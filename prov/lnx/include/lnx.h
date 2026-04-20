@@ -33,6 +33,8 @@
 #ifndef LNX_H
 #define LNX_H
 
+#define LNX_IGNORE_TAG 	((uint64_t) UINT32_MAX)
+
 #define LNX_NUM_HISTORY		4096
 #define LNX_MAX_LOCAL_EPS 	16
 #define LNX_IOV_LIMIT 		4
@@ -103,6 +105,17 @@ struct lnx_t_traffic_stats {
 	uint64_t st_num_unexp_msgs;
 };
 
+struct lnx_traffic_stats {
+	uint64_t st_num_send;
+	uint64_t st_num_sendv;
+	uint64_t st_num_sendmsg;
+	uint64_t st_num_senddata;
+	uint64_t st_num_inject;
+	uint64_t st_num_injectdata;
+	uint64_t st_num_posted_recvs;
+	uint64_t st_num_unexp_msgs;
+};
+
 struct lnx_core_ep {
 	struct dlist_entry cep_av_entry;
 	struct fid_peer_srx cep_srx;
@@ -112,6 +125,7 @@ struct lnx_core_ep {
 	struct lnx_core_av *cep_cav;
 	struct lnx_ep *cep_parent;
 	struct lnx_t_traffic_stats cep_t_stats;
+	struct lnx_traffic_stats cep_stats;
 };
 
 struct lnx_core_cq {

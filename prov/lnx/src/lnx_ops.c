@@ -67,17 +67,6 @@ static void (*lnx_set_send_pair[LNX_MR_SELECTION_MAX])
 	[LNX_MR_SELECTION_PER_PEER] = lnx_set_send_pair_peer,
 };
 
-int lnx_get_msg(struct fid_peer_srx *srx, struct fi_peer_match_attr *match,
-		struct fi_peer_rx_entry **entry)
-{
-	return -FI_ENOSYS;
-}
-
-int lnx_queue_msg(struct fi_peer_rx_entry *entry)
-{
-	return -FI_ENOSYS;
-}
-
 void lnx_free_entry(struct fi_peer_rx_entry *entry)
 {
 	struct lnx_rx_entry *rx_entry;
@@ -100,6 +89,8 @@ lnx_init_rx_entry(struct lnx_rx_entry *entry, const struct iovec *iov,
 		  void **desc, size_t count, fi_addr_t addr, uint64_t tag,
 		  uint64_t ignore, void *context, uint64_t flags)
 {
+	bool tagged = (ignore == LNX_IGNORE_TAG);
+
 	if (iov)
 		memcpy(&entry->rx_iov, iov, sizeof(*iov) * count);
 	if (desc)
@@ -111,7 +102,10 @@ lnx_init_rx_entry(struct lnx_rx_entry *entry, const struct iovec *iov,
 	entry->rx_entry.addr = addr;
 	entry->rx_entry.context = context;
 	entry->rx_entry.tag = tag;
-	entry->rx_entry.flags = flags | FI_TAGGED | FI_RECV;
+	if (tagged)
+		entry->rx_entry.flags = flags | FI_TAGGED | FI_RECV;
+	else
+		entry->rx_entry.flags = flags | FI_MSG | FI_RECV;
 	entry->rx_ignore = ignore;
 }
 
@@ -212,6 +206,21 @@ int lnx_queue_tag(struct fi_peer_rx_entry *entry)
 	return 0;
 }
 
+int lnx_queue_msg(struct fi_peer_rx_entry *entry)
+{
+	struct lnx_rx_entry *rx_entry;
+	struct lnx_peer_srq *lnx_srq = (struct lnx_peer_srq*)entry->owner_context;
+
+	rx_entry = container_of(entry, struct lnx_rx_entry, rx_entry);
+	FI_DBG(&lnx_prov, FI_LOG_CORE,
+		"addr = %lx tag = 0 ignore = %lx found\n",
+		entry->addr, LNX_IGNORE_TAG);
+
+	lnx_insert_rx_entry(&lnx_srq->lps_recv.lqp_unexq, rx_entry);
+
+	return 0;
+}
+
 int lnx_get_tag(struct fid_peer_srx *srx, struct fi_peer_match_attr *match,
 		struct fi_peer_rx_entry **entry)
 {
@@ -281,14 +290,92 @@ finalize:
 out:
 	return rc;
 }
+int lnx_get_msg(struct fid_peer_srx *srx, struct fi_peer_match_attr *match,
+		struct fi_peer_rx_entry **entry)
+{
+	struct lnx_match_attr match_attr = {0};
+	struct lnx_peer_srq *lnx_srq;
+	struct lnx_core_ep *cep;
+	struct lnx_ep *lep;
+	struct lnx_rx_entry *rx_entry;
+	fi_addr_t addr = match->addr;
+	uint64_t ignore = LNX_IGNORE_TAG;
+	uint64_t tag = 0;
+	int rc = 0;
+
+	cep = srx->ep_fid.fid.context;
+	lep = cep->cep_parent;
+	lnx_srq = &lep->le_srq;
+
+	match_attr.lm_addr = addr;
+	match_attr.lm_ignore = ignore;
+	match_attr.lm_tag = tag;
+
+	rx_entry = lnx_remove_first_match(&lnx_srq->lps_recv.lqp_recvq,
+					  &match_attr);
+	if (rx_entry) {
+		FI_DBG(&lnx_prov, FI_LOG_CORE,
+		       "addr = %lx tag = 0 ignore = 0 found\n",
+		       match_attr.lm_addr);
+
+		goto assign;
+	}
+
+	FI_DBG(&lnx_prov, FI_LOG_CORE,
+	       "addr = %lx tag = 0 ignore = 0 not found\n",
+	       match_attr.lm_addr);
+
+	rx_entry = get_rx_entry(lep, NULL, NULL, 0, addr, tag, ignore, NULL,
+				FI_MSG | FI_RECV);
+	if (!rx_entry) {
+		rc = -FI_ENOMEM;
+		goto out;
+	}
+
+	rx_entry->rx_entry.owner_context = lnx_srq;
+	rx_entry->rx_cep = cep;
+
+	rc = -FI_ENOENT;
+
+	cep->cep_stats.st_num_unexp_msgs++;
+
+	goto finalize;
+
+assign:
+	cep->cep_stats.st_num_posted_recvs++;
+
+	rx_entry->rx_entry.addr = lnx_get_core_addr(cep, addr);
+	if (rx_entry->rx_entry.desc && *rx_entry->rx_entry.desc) {
+		rc = lnx_mr_regattr_core(cep->cep_domain,
+					 *rx_entry->rx_entry.desc,
+					 rx_entry->rx_entry.desc);
+		if (rc)
+			return rc;
+	}
+finalize:
+	rx_entry->rx_entry.msg_size = match->msg_size;
+	*entry = &rx_entry->rx_entry;
+
+out:
+	return rc;
+}
+
 
 static int
 lnx_discard(struct lnx_ep *lep, struct lnx_rx_entry *rx_entry, void *context)
 {
 	struct lnx_core_ep *cep = rx_entry->rx_cep;
 	int rc;
-
-	rc = cep->cep_srx.peer_ops->discard_tag(&rx_entry->rx_entry);
+	if (rx_entry->rx_entry.flags & FI_MSG)
+		rc = cep->cep_srx.peer_ops->discard_msg(&rx_entry->rx_entry);
+	else if (rx_entry->rx_entry.flags & FI_TAGGED)
+		rc = cep->cep_srx.peer_ops->discard_tag(&rx_entry->rx_entry);
+	else {
+	// FIXME What to do if neither of these flags?
+		FI_WARN(&lnx_prov, FI_LOG_CORE,
+			"Error discarding message from %s\n",
+			cep->cep_domain->cd_info->fabric_attr->name);
+	}
 	if (rc) {
 		FI_WARN(&lnx_prov, FI_LOG_CORE,
 			"Error discarding message from %s\n",
@@ -315,8 +402,15 @@ lnx_peek(struct lnx_ep *lep, struct lnx_match_attr *match_attr, void *context,
 	struct lnx_rx_entry *rx_entry;
 	struct lnx_peer_srq *lnx_srq = &lep->le_srq;
 
-	rx_entry = lnx_find_first_match(&lnx_srq->lps_trecv.lqp_unexq,
+	if (flags & FI_MSG){
+		rx_entry = lnx_find_first_match(&lnx_srq->lps_recv.lqp_unexq,
 					match_attr);
+	}
+	else if (flags & FI_TAGGED) {
+		rx_entry = lnx_find_first_match(&lnx_srq->lps_trecv.lqp_unexq,
+					match_attr);
+	}
+	// FIXME What to do if neither flag?
 	if (!rx_entry) {
 		FI_DBG(&lnx_prov, FI_LOG_CORE,
 			"PEEK addr=%" PRIx64 " tag=%" PRIx64 " ignore=%" PRIx64 "\n",
@@ -397,8 +491,14 @@ static int lnx_process_recv(struct lnx_ep *lep, const struct iovec *iov, void *d
 		rx_entry = (struct lnx_rx_entry *)
 			(((struct fi_context *)context)->internal[0]);
 	} else {
-		rx_entry = lnx_remove_first_match(&lnx_srq->lps_trecv.lqp_unexq,
+		if (tagged) {
+			rx_entry = lnx_remove_first_match(&lnx_srq->lps_trecv.lqp_unexq,
 						&match_attr);
+		}
+		else {
+			rx_entry = lnx_remove_first_match(&lnx_srq->lps_recv.lqp_unexq,
+						&match_attr);
+		}
 		if (!rx_entry) {
 			FI_DBG(&lnx_prov, FI_LOG_CORE,
 			"addr=%" PRIx64 " tag=%" PRIx64 " ignore=%" PRIx64 " buf=%p len=%zu not found\n",
@@ -469,7 +569,10 @@ nomatch:
 	}
 
 insert_recvq:
-	lnx_insert_rx_entry(&lnx_srq->lps_trecv.lqp_recvq, rx_entry);
+	if (tagged)
+		lnx_insert_rx_entry(&lnx_srq->lps_trecv.lqp_recvq, rx_entry);
+	else
+		lnx_insert_rx_entry(&lnx_srq->lps_recv.lqp_recvq, rx_entry);
 
 out:
 	return rc;
@@ -713,6 +816,7 @@ ssize_t lnx_tsenddata(struct fid_ep *ep, const void *buf, size_t len, void *desc
 	return rc;
 }
 
+
 ssize_t lnx_tinjectdata(struct fid_ep *ep, const void *buf, size_t len,
 			uint64_t data, fi_addr_t dest_addr, uint64_t tag)
 {
@@ -754,19 +858,6 @@ struct fi_ops_tagged lnx_tagged_ops = {
 	.injectdata = lnx_tinjectdata,
 };
 
-struct fi_ops_msg lnx_msg_ops = {
-	.size = sizeof(struct fi_ops_msg),
-	.recv = fi_no_msg_recv,
-	.recvv = fi_no_msg_recvv,
-	.recvmsg = fi_no_msg_recvmsg,
-	.send = fi_no_msg_send,
-	.sendv = fi_no_msg_sendv,
-	.sendmsg = fi_no_msg_sendmsg,
-	.inject = fi_no_msg_inject,
-	.senddata = fi_no_msg_senddata,
-	.injectdata = fi_no_msg_injectdata,
-};
-
 struct fi_ops_rma lnx_rma_ops = {
 	.size = sizeof(struct fi_ops_rma),
 	.read = fi_no_rma_read,
@@ -797,4 +888,279 @@ struct fi_ops_atomic lnx_atomic_ops = {
 	.compwritevalid = fi_no_atomic_compwritevalid,
 };
 
+ssize_t lnx_recv(struct fid_ep *ep, void *buf, size_t len, void *desc,
+		fi_addr_t src_addr, void *context)
+{
+	struct lnx_ep *lep;
+	const struct iovec iov = {.iov_base = buf, .iov_len = len};
 
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+
+	return lnx_process_recv(lep, &iov, desc, src_addr, 1, 0, LNX_IGNORE_TAG,
+				context, lnx_ep_rx_flags(lep), false);
+}
+
+ssize_t lnx_recvv(struct fid_ep *ep, const struct iovec *iov, void **desc,
+		size_t count, fi_addr_t src_addr,
+		void *context)
+{
+	void *mr_desc;
+	struct lnx_ep *lep;
+
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+	if (count == 0) {
+		mr_desc = NULL;
+	} else if (iov && count >= 1 &&
+		   count <= lep->le_domain->ld_iov_limit) {
+		mr_desc = desc ? desc[0] : NULL;
+	} else {
+		FI_WARN(&lnx_prov, FI_LOG_CORE, "Invalid IOV\n");
+		return -FI_EINVAL;
+	}
+
+	return lnx_process_recv(lep, iov, mr_desc, src_addr, count, 0, LNX_IGNORE_TAG,
+				context, lnx_ep_rx_flags(lep), false);
+}
+
+ssize_t lnx_recvmsg(struct fid_ep *ep, const struct fi_msg *msg,
+		     uint64_t flags)
+{
+	void *mr_desc;
+	struct lnx_ep *lep;
+
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+
+	if (msg->iov_count == 0) {
+		mr_desc = NULL;
+	} else if (msg->msg_iov && msg->iov_count >= 1 &&
+		   msg->iov_count <= lep->le_domain->ld_iov_limit) {
+		mr_desc = msg->desc ? msg->desc[0] : NULL;
+	} else {
+		FI_WARN(&lnx_prov, FI_LOG_CORE, "Invalid IOV\n");
+		return -FI_EINVAL;
+	}
+
+	return lnx_process_recv(lep, msg->msg_iov, mr_desc, msg->addr, msg->iov_count,
+				0, LNX_IGNORE_TAG, msg->context,
+				flags | lep->le_ep.rx_msg_flags, false);
+}
+
+ssize_t lnx_send(struct fid_ep *ep, const void *buf, size_t len, void *desc,
+		fi_addr_t dest_addr, void *context)
+{
+	int rc;
+	struct lnx_ep *lep;
+	void *core_desc = NULL;
+	struct lnx_core_ep *cep;
+	fi_addr_t core_addr;
+
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+
+	rc = lnx_select_send_endpoints[lep->le_mr](lep, dest_addr, &cep, &core_addr);
+	if (rc)
+		return rc;
+
+	FI_DBG(&lnx_prov, FI_LOG_CORE,
+	       "sending to %" PRIx64 " buf %p len %zu\n",
+	       core_addr, buf, len);
+
+	if (desc) {
+		rc = lnx_mr_regattr_core(cep->cep_domain, desc, &core_desc);
+		if (rc)
+			return rc;
+	}
+
+	rc = fi_send(cep->cep_ep, buf, len, core_desc, core_addr, context);
+
+	if (!rc)
+		cep->cep_stats.st_num_send++;
+
+	return rc;
+}
+
+ssize_t lnx_sendv(struct fid_ep *ep, const struct iovec *iov, void **desc,
+		size_t count, fi_addr_t dest_addr, void *context)
+{
+	int rc;
+	struct lnx_ep *lep;
+	void *core_desc = NULL;
+	struct lnx_core_ep *cep;
+	fi_addr_t core_addr;
+
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+
+	rc = lnx_select_send_endpoints[lep->le_mr](lep, dest_addr, &cep, &core_addr);
+	if (rc)
+		return rc;
+
+	FI_DBG(&lnx_prov, FI_LOG_CORE,
+	       "sending to %" PRIx64 " buf %p len %zu\n",
+	       core_addr, tag, iov->iov_base, iov->iov_len);
+
+	if (desc && *desc) {
+		rc = lnx_mr_regattr_core(cep->cep_domain, *desc, &core_desc);
+		if (rc)
+			return rc;
+	}
+
+	rc = fi_sendv(cep->cep_ep, iov, (core_desc) ? &core_desc : NULL,
+		       count, core_addr, context);
+
+	if (!rc)
+		cep->cep_stats.st_num_sendv++;
+
+	return rc;
+}
+
+ssize_t lnx_sendmsg(struct fid_ep *ep, const struct fi_msg *msg,
+		uint64_t flags)
+{
+	int rc;
+	struct lnx_ep *lep;
+	void *core_desc = NULL;
+	struct lnx_core_ep *cep;
+	struct fi_msg core_msg;
+
+	memcpy(&core_msg, msg, sizeof(*msg));
+
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+
+	rc = lnx_select_send_endpoints[lep->le_mr](lep, core_msg.addr, &cep, &core_msg.addr);
+	if (rc)
+		return rc;
+
+	FI_DBG(&lnx_prov, FI_LOG_CORE,
+	       "sending to %" PRIx64 "\n",
+	       core_msg.addr);
+
+	if (core_msg.desc && *core_msg.desc) {
+		rc = lnx_mr_regattr_core(cep->cep_domain, *core_msg.desc, &core_desc);
+		if (rc)
+			return rc;
+		core_msg.desc = &core_desc;
+	}
+
+	rc = fi_sendmsg(cep->cep_ep, &core_msg, flags);
+
+	if (!rc)
+		cep->cep_stats.st_num_sendmsg++;
+
+	return rc;
+}
+
+ssize_t lnx_inject(struct fid_ep *ep, const void *buf, size_t len,
+		fi_addr_t dest_addr)
+{
+	int rc;
+	struct lnx_ep *lep;
+	struct lnx_core_ep *cep;
+	fi_addr_t core_addr;
+
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+
+	rc = lnx_select_send_endpoints[lep->le_mr](lep, dest_addr, &cep, &core_addr);
+	if (rc)
+		return rc;
+
+	FI_DBG(&lnx_prov, FI_LOG_CORE,
+	       "sending to %" PRIx64 " buf %p len %zu\n",
+	       core_addr, buf, len);
+
+	rc = fi_inject(cep->cep_ep, buf, len, core_addr);
+
+	if (!rc)
+		cep->cep_stats.st_num_inject++;
+
+	return rc;
+}
+
+ssize_t lnx_senddata(struct fid_ep *ep, const void *buf, size_t len, void *desc,
+		uint64_t data, fi_addr_t dest_addr, void *context)
+{
+	int rc;
+	struct lnx_ep *lep;
+	struct lnx_core_ep *cep;
+	fi_addr_t core_addr;
+	void *core_desc = desc;
+
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+
+	rc = lnx_select_send_endpoints[lep->le_mr](lep, dest_addr, &cep, &core_addr);
+	if (rc)
+		return rc;
+
+	FI_DBG(&lnx_prov, FI_LOG_CORE,
+	       "sending to %lx buf %p len %ld\n",
+	       core_addr, buf, len);
+
+	if (desc) {
+		rc = lnx_mr_regattr_core(cep->cep_domain, desc, &core_desc);
+		if (rc)
+			return rc;
+	}
+
+	rc = fi_senddata(cep->cep_ep, buf, len, core_desc,
+			  data, core_addr, context);
+
+	if (!rc)
+		cep->cep_stats.st_num_senddata++;
+
+	return rc;
+}
+
+ssize_t lnx_injectdata(struct fid_ep *ep, const void *buf, size_t len,
+			uint64_t data, fi_addr_t dest_addr)
+{
+	int rc;
+	struct lnx_ep *lep;
+	struct lnx_core_ep *cep;
+	fi_addr_t core_addr;
+
+	lep = container_of(ep, struct lnx_ep, le_ep.ep_fid.fid);
+	if (!lep)
+		return -FI_ENOSYS;
+
+	rc = lnx_select_send_endpoints[lep->le_mr](lep, dest_addr, &cep, &core_addr);
+	if (rc)
+		return rc;
+
+	FI_DBG(&lnx_prov, FI_LOG_CORE,
+	       "sending to %" PRIx64 " buf %p len %zu\n",
+	       core_addr, buf, len);
+
+	rc = fi_injectdata(cep->cep_ep, buf, len, data, core_addr);
+
+	if (!rc)
+		cep->cep_stats.st_num_injectdata++;
+
+	return rc;
+}
+
+struct fi_ops_msg lnx_msg_ops = {
+	.size = sizeof(struct fi_ops_msg),
+	.recv = lnx_recv,
+	.recvv = lnx_recvv,
+	.recvmsg = lnx_recvmsg,
+	.send = lnx_send,
+	.sendv = lnx_sendv,
+	.sendmsg = lnx_sendmsg,
+	.inject = lnx_inject,
+	.senddata = lnx_senddata,
+	.injectdata = lnx_injectdata,
+};
