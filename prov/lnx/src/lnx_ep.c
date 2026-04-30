@@ -65,6 +65,7 @@ static struct fi_ops_srx_owner lnx_srx_ops = {
 	.foreach_unspec_addr = lnx_foreach_unspec_addr,
 };
 
+// FIXME How do we want to address tagged vs untagged stats. Just print all? Check if one/other exists?
 static inline void lnx_dump_core_ep_stats(struct lnx_core_ep *cep)
 {
 	struct lnx_t_traffic_stats *tstats;
@@ -93,6 +94,7 @@ lnx_dump_srx_queue_stats(struct lnx_ep *lep)
 		header = true;
 	}
 
+        // FIXME Need to update this to check the untagged queue as well
 	FI_TRACE(&lnx_prov, FI_LOG_DOMAIN,
 		 "RECVQ,-,-,-,-,-,-,-,-,%" PRIu64 ",%" PRIu64 "\n",
 		 lep->le_srq.lps_trecv.lqp_recvq.lq_max,
@@ -113,7 +115,8 @@ int lnx_ep_close(struct fid *fid)
 	lep = container_of(fid, struct lnx_ep, le_ep.ep_fid.fid);
 
 	fi_param_get_bool(&lnx_prov, "dump_stats", &dump_stats);
-
+	
+	// FIXME double call for both, pass queue/stats
 	if (dump_stats)
 		lnx_dump_srx_queue_stats(lep);
 
@@ -525,8 +528,11 @@ static int lnx_common_match(uint64_t tag, uint64_t match_tag,
 	fi_addr_t addr1 = lnx_decode_primary_id(recv_addr);
 	fi_addr_t addr2 = lnx_decode_primary_id(addr);
 
+
 	bool tmatch = ((tag | ignore) == (match_tag | ignore));
 
+	//printf("Addr1: %lx Addr2: %lx tag: %lx match_tag: %lx ignore: %lx tmatch: %d\n", addr1, addr2, tag, match_tag, ignore, tmatch);
+	
 	if (recv_addr == FI_ADDR_UNSPEC)
 		return tmatch;
 

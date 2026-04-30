@@ -102,10 +102,12 @@ lnx_init_rx_entry(struct lnx_rx_entry *entry, const struct iovec *iov,
 	entry->rx_entry.addr = addr;
 	entry->rx_entry.context = context;
 	entry->rx_entry.tag = tag;
+
 	if (tagged)
 		entry->rx_entry.flags = flags | FI_TAGGED | FI_RECV;
 	else
 		entry->rx_entry.flags = flags | FI_MSG | FI_RECV;
+
 	entry->rx_ignore = ignore;
 }
 
@@ -366,16 +368,12 @@ lnx_discard(struct lnx_ep *lep, struct lnx_rx_entry *rx_entry, void *context)
 {
 	struct lnx_core_ep *cep = rx_entry->rx_cep;
 	int rc;
-	if (rx_entry->rx_entry.flags & FI_MSG)
-		rc = cep->cep_srx.peer_ops->discard_msg(&rx_entry->rx_entry);
-	else if (rx_entry->rx_entry.flags & FI_TAGGED)
+
+	if (rx_entry->rx_entry.flags & FI_TAGGED)
 		rc = cep->cep_srx.peer_ops->discard_tag(&rx_entry->rx_entry);
-	else {
-	// FIXME What to do if neither of these flags?
-		FI_WARN(&lnx_prov, FI_LOG_CORE,
-			"Error discarding message from %s\n",
-			cep->cep_domain->cd_info->fabric_attr->name);
-	}
+	else
+		rc = cep->cep_srx.peer_ops->discard_msg(&rx_entry->rx_entry);
+
 	if (rc) {
 		FI_WARN(&lnx_prov, FI_LOG_CORE,
 			"Error discarding message from %s\n",
@@ -402,15 +400,15 @@ lnx_peek(struct lnx_ep *lep, struct lnx_match_attr *match_attr, void *context,
 	struct lnx_rx_entry *rx_entry;
 	struct lnx_peer_srq *lnx_srq = &lep->le_srq;
 
-	if (flags & FI_MSG){
-		rx_entry = lnx_find_first_match(&lnx_srq->lps_recv.lqp_unexq,
-					match_attr);
-	}
-	else if (flags & FI_TAGGED) {
+	if (flags & FI_TAGGED) {
 		rx_entry = lnx_find_first_match(&lnx_srq->lps_trecv.lqp_unexq,
 					match_attr);
 	}
-	// FIXME What to do if neither flag?
+	else {
+		rx_entry = lnx_find_first_match(&lnx_srq->lps_recv.lqp_unexq,
+					match_attr);
+	}
+
 	if (!rx_entry) {
 		FI_DBG(&lnx_prov, FI_LOG_CORE,
 			"PEEK addr=%" PRIx64 " tag=%" PRIx64 " ignore=%" PRIx64 "\n",
@@ -477,6 +475,16 @@ static int lnx_process_recv(struct lnx_ep *lep, const struct iovec *iov, void *d
 		encoded_addr;
 	match_attr.lm_ignore = ignore;
 	match_attr.lm_tag = tag;
+
+	/* Check if the flags are marked as tagged or untagged,
+	 * otherwise fail out.
+	 */
+	if (!(flags | FI_TAGGED) && !(flags | FI_MSG)) {
+		FI_DBG(&lnx_prov, FI_LOG_CORE,
+		"Flags are not set properly, message is not marked as FI_TAGGED or FI_MSG\n");
+		rc = FI_EINVAL;
+		goto out;
+	}
 
 	if (flags & FI_PEEK)
 		return lnx_peek(lep, &match_attr, context, flags);
